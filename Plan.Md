@@ -1,4 +1,4 @@
-Drop this into PLAN.md at the root of your repository. It resolves the major cross-compilation, static-linking, AF_HYPERV permission, and Wayland protocol traps upfront so your coding agent doesn't burn tokens hitting dead ends.
+
 
 Markdown
 # Project Specification: WSLDesk
