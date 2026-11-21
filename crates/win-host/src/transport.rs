@@ -26,7 +26,8 @@ use windows::Win32::System::Hypervisor::{HV_PROTOCOL_RAW, SOCKADDR_HV};
 
 use crate::wsl_cli::{self, WslError};
 use common::protocol::{
-    decode_frame, encode_frame, ControlMessage, FrameCompression, VideoFrameHeader,
+    decode_dirty_rects, decode_frame, encode_frame, ControlMessage, DirtyRectHeader,
+    FrameCompression, VideoFrameHeader,
     WireError, CONTROL_MAGIC, MAX_CONTROL_FRAME_LEN, VIDEO_FRAME_HEADER_LEN, VIDEO_PORT,
 };
 
@@ -372,7 +373,18 @@ const MAX_VIDEO_PAYLOAD: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub header: VideoFrameHeader,
-    /// Packed pixel bytes (stride == width*4), `pixel_format` byte order.
+    pub payload: FramePayload,
+}
+
+#[derive(Debug, Clone)]
+pub enum FramePayload {
+    Full(Vec<u8>),
+    DirtyRects(Vec<DirtyRect>),
+}
+
+#[derive(Debug, Clone)]
+pub struct DirtyRect {
+    pub region: DirtyRectHeader,
     pub pixels: Vec<u8>,
 }
 
@@ -380,6 +392,13 @@ impl DecodedFrame {
     /// Approximate compressed size of this frame on the wire (header + LZ4).
     pub fn wire_len(&self) -> usize {
         VIDEO_FRAME_HEADER_LEN + self.header.payload_len as usize
+    }
+
+    pub fn pixel_len(&self) -> usize {
+        match &self.payload {
+            FramePayload::Full(pixels) => pixels.len(),
+            FramePayload::DirtyRects(rects) => rects.iter().map(|rect| rect.pixels.len()).sum(),
+        }
     }
 }
 
@@ -406,10 +425,24 @@ impl VideoStream {
     }
 
     /// Receive, validate, and decode one frame.
+    pub fn wait_readable(&self, timeout: Duration) -> bool {
+        select_readable(self.sock.raw, timeout)
+    }
+
+    /// Receive, validate, and decode one frame after it becomes readable.
     pub fn recv_frame(&self) -> Result<DecodedFrame, TransportError> {
         let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_LEN];
         self.sock.recv_exact(&mut header_bytes)?;
         let header = VideoFrameHeader::from_bytes(&header_bytes)?;
+        let full_len = u64::from(header.width) * u64::from(header.height);
+        let full_len = full_len.checked_mul(4)
+            .filter(|len| (1..=MAX_VIDEO_PAYLOAD as u64).contains(len))
+            .ok_or_else(|| TransportError::Wsa(0, "invalid video dimensions".into()))? as usize;
+        if header.width.checked_mul(4) != Some(header.stride)
+            || header.rect_count > common::protocol::MAX_DIRTY_RECTS
+        {
+            return Err(TransportError::Wsa(0, "invalid video stride or rectangle count".into()));
+        }
         if header.payload_len as usize > MAX_VIDEO_PAYLOAD {
             return Err(TransportError::Wsa(
                 0,
@@ -418,28 +451,44 @@ impl VideoStream {
         }
         let mut payload = vec![0u8; header.payload_len as usize];
         self.sock.recv_exact(&mut payload)?;
+        let max_decoded = if header.rect_count == 0 {
+            full_len
+        } else {
+            MAX_VIDEO_PAYLOAD
+        };
         let pixels = match header.compression {
-            FrameCompression::Lz4 => lz4_flex::decompress_size_prepended(&payload)
-                .map_err(|err| TransportError::Wsa(0, format!("lz4 decompress failed: {err}")))?,
+            FrameCompression::Lz4 => {
+                let len = payload.first_chunk::<4>().map(|bytes| u32::from_le_bytes(*bytes) as usize);
+                if len.is_none_or(|len| len > max_decoded || len == 0) {
+                    return Err(TransportError::Wsa(0, "invalid LZ4 decoded size".into()));
+                }
+                lz4_flex::decompress_size_prepended(&payload)
+                    .map_err(|err| TransportError::Wsa(0, format!("lz4 decompress failed: {err}")))?
+            }
             FrameCompression::Raw => payload,
         };
-        let expected = header.width as usize * 4 * header.height as usize;
-        if pixels.len() != expected {
+        if header.rect_count == 0 && pixels.len() != full_len {
             return Err(TransportError::Wsa(
                 0,
                 format!(
                     "frame size mismatch: decoded {} bytes, expected {} ({}x{} BGRA/RGBA)",
                     pixels.len(),
-                    expected,
+                    full_len,
                     header.width,
                     header.height
                 ),
             ));
         }
-        Ok(DecodedFrame {
-            header,
-            pixels,
-        })
+        let payload = if header.rect_count == 0 {
+            FramePayload::Full(pixels)
+        } else {
+            FramePayload::DirtyRects(
+                decode_dirty_rects(&pixels, header.rect_count, header.width, header.height)?
+                    .into_iter().map(|(region, data)| DirtyRect { region, pixels: data.to_vec() })
+                    .collect(),
+            )
+        };
+        Ok(DecodedFrame { header, payload })
     }
 }
 

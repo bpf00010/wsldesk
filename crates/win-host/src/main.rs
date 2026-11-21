@@ -83,6 +83,9 @@ enum Command {
         fullscreen: bool,
         #[arg(long)]
         no_audio: bool,
+        /// Requested guest output refresh in Hz (30–240).
+        #[arg(long)]
+        fps: Option<u32>,
     },
     /// Print a pass/warn/fail diagnostic table for a distro.
     Doctor {
@@ -145,6 +148,9 @@ enum Command {
         /// Trace keyboard forwarding while the viewport is focused.
         #[arg(long)]
         debug_input: bool,
+        /// Requested guest output refresh in Hz (30–240, default 144).
+        #[arg(long)]
+        fps: Option<u32>,
     },
 }
 
@@ -173,10 +179,10 @@ fn main() -> ExitCode {
             shutdown,
             install_desktop,
         ))),
-        Command::Up { distro, width, height, fullscreen, no_audio } =>
+        Command::Up { distro, width, height, fullscreen, no_audio, fps } =>
             map_exit(resolve_distro(distro).and_then(|distro| {
                 run_setup(&distro, false, false, None, false, false, false)?;
-                run_launch(&distro, "", width, height, 1.0, true, false, None, no_audio, fullscreen, false)
+                run_launch(&distro, "", width, height, 1.0, true, false, None, no_audio, fullscreen, false, fps)
             })),
         Command::Doctor { distro } => map_exit(resolve_distro(distro).and_then(|distro| run_doctor(&distro))),
         Command::Ping {
@@ -200,6 +206,7 @@ fn main() -> ExitCode {
             no_audio,
             fullscreen,
             debug_input,
+            fps,
         } => map_exit(run_launch(
             &distro,
             &session,
@@ -212,6 +219,7 @@ fn main() -> ExitCode {
             no_audio,
             fullscreen,
             debug_input,
+            fps,
         )),
     }
 }
@@ -695,6 +703,7 @@ fn run_launch(
     no_audio: bool,
     fullscreen: bool,
     debug_input: bool,
+    fps: Option<u32>,
 ) -> Result<bool> {
     input::DEBUG_INPUT.store(debug_input, std::sync::atomic::Ordering::Relaxed);
     use std::sync::Arc;
@@ -703,6 +712,9 @@ fn run_launch(
     use common::protocol::ControlMessage;
 
     let scale_milli = (scale * 1000.0).round().clamp(500.0, 8000.0) as u32;
+    let refresh_mhz = fps.map_or_else(common::protocol::default_refresh_mhz, |fps| {
+        fps.clamp(30, 240) * 1000
+    });
 
     let conn = connect_control_plane(distro, autostart)?;
     let (guest_version, has_dxg, systemd_active) = handshake(&conn, distro)?;
@@ -735,6 +747,7 @@ fn run_launch(
         height,
         scale_milli,
         no_audio,
+        refresh_mhz,
     })?;
     let reply = conn.recv_msg()?;
     let ControlMessage::SessionStarted {
@@ -765,62 +778,14 @@ fn run_launch(
         );
     }
 
-    // --headless-frames: prove the whole capture pipeline non-interactively
-    // (M4B: injects a test InputEvent + live Resize after 3 frames, then
-    // waits until the captured geometry actually flips to 800x600 — up to 30
-    // frames total — so mode-switch latency can't cause a false negative).
+    // Receive the requested sample before injecting input and a live resize.
     // Always tear down — even when receiving fails — so a failed run never
     // leaks /run/user/1000/wsldesk-* or an orphaned compositor.
-    if headless_frames.is_some() {
+    if let Some(frame_sample) = headless_frames {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let inject_conn = std::sync::Mutex::new(&conn);
-        let injector = move |frame_no: u64| {
-            // Test InputEvent: pointer to the center + key A down/up.
-            let _ = inject_conn
-                .lock()
-                .unwrap()
-                .send_msg(&ControlMessage::InputEvent(
-                    common::protocol::InputPayload::PointerMotionAbsolute {
-                        x: width / 2,
-                        y: height / 2,
-                        width,
-                        height,
-                    },
-                ));
-            let _ = inject_conn
-                .lock()
-                .unwrap()
-                .send_msg(&ControlMessage::InputEvent(
-                    common::protocol::InputPayload::Key {
-                        code: common::keymap::KEY_A,
-                        pressed: true,
-                    },
-                ));
-            let _ = inject_conn
-                .lock()
-                .unwrap()
-                .send_msg(&ControlMessage::InputEvent(
-                    common::protocol::InputPayload::Key {
-                        code: common::keymap::KEY_A,
-                        pressed: false,
-                    },
-                ));
-            // Live resize test: requested size → 800x600 proves
-            // zwlr_output_management reconfiguration mid-session.
-            let _ = inject_conn.lock().unwrap().send_msg(&ControlMessage::Resize {
-                width: 800,
-                height: 600,
-                scale_milli,
-            });
-            let _ = frame_no;
-        };
-        let live_resize_tested = width != 800 && height != 600;
+        let live_resize_tested = (width, height) != (800, 600);
         let received = renderer::receive_headless_frames(
-            distro,
-            3,
-            if live_resize_tested { Some((800, 600)) } else { None },
-            &stop,
-            Some(&injector),
+            distro, frame_sample.max(1), (width, height), scale_milli, refresh_mhz, &conn, &stop,
         );
         let mut last_dims = (0u32, 0u32);
         let mut resize_flipped = false;
@@ -839,6 +804,12 @@ fn run_launch(
                     stats.raw_bytes as f64 / 1_048_576.0,
                     stats.raw_bytes as f64 / stats.wire_bytes.max(1) as f64
                 );
+                println!(
+                    "  {} full frames, {} dirty frames; mean dirty frame: {:.0} wire bytes",
+                    stats.full_frames,
+                    stats.dirty_frames,
+                    stats.dirty_wire_bytes as f64 / stats.dirty_frames.max(1) as f64,
+                );
                 (Some(stats), Some(checksum_ok))
             }
             Err(err) => {
@@ -855,8 +826,8 @@ fn run_launch(
                 true
             } else {
                 eprintln!(
-                    "live resize verification FAILED: no frame arrived at 800x600 within \
-                     30 frames (last frame {last_dims:?}, injected Resize after 3 frames)"
+                    "live resize verification FAILED: no frame arrived at 800x600 \
+                     (last frame {last_dims:?})"
                 );
                 false
             }
@@ -911,6 +882,9 @@ fn run_launch(
         conn,
         publisher,
         fullscreen,
+        (width, height, scale_milli),
+        refresh_mhz,
+        fps.is_none(),
     )?;
     Ok(true)
 }
@@ -939,7 +913,7 @@ fn live_sway_input() -> Result<()> {
     handshake(&conn, "Ubuntu")?;
     conn.send_msg(&ControlMessage::StartSession {
         session_id: "sway".into(), width: 1280, height: 720,
-        scale_milli: 1000, no_audio: true,
+        scale_milli: 1000, no_audio: true, refresh_mhz: common::protocol::default_refresh_mhz(),
     })?;
     if !matches!(conn.recv_msg()?, ControlMessage::SessionStarted { .. }) {
         bail!("Sway did not start");
@@ -1052,6 +1026,7 @@ fn run_launch(
     _no_audio: bool,
     _fullscreen: bool,
     _debug_input: bool,
+    _fps: Option<u32>,
 ) -> Result<bool> {
     bail!("control plane is Windows-only (distro '{distro}'); build wsldesk.exe on x86_64-pc-windows-msvc")
 }

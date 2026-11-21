@@ -14,7 +14,12 @@ use serde::{Deserialize, Serialize};
 use crate::ProbeReport;
 
 /// Wire protocol version negotiated in `Hello`/`Welcome`.
-pub const PROTOCOL_VERSION: u32 = 1;
+// v2 adds damage frames that a v1 texture receiver cannot apply.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+pub const fn default_refresh_mhz() -> u32 {
+    144_000
+}
 
 /// Control-plane VSOCK/Hyper-V service port.
 pub const CONTROL_PORT: u32 = 50001;
@@ -34,6 +39,8 @@ pub const CONTROL_HEADER_LEN: usize = 8;
 
 /// Video frame fixed header length in bytes.
 pub const VIDEO_FRAME_HEADER_LEN: usize = 32;
+pub const DIRTY_RECT_HEADER_LEN: usize = 16;
+pub const MAX_DIRTY_RECTS: u16 = 16;
 
 /// Pixel formats carried on the video plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +89,8 @@ pub enum ControlMessage {
         /// When true, strip the WSLg `PULSE_SERVER` variable so the session
         /// has no Linux → Windows audio path (default: preserved).
         no_audio: bool,
+        #[serde(default = "default_refresh_mhz")]
+        refresh_mhz: u32,
     },
     /// Guest → host: session is live; the compositor accepted a Wayland
     /// client socket inside the isolated runtime dir.
@@ -117,6 +126,8 @@ pub enum ControlMessage {
         width: u32,
         height: u32,
         scale_milli: u32,
+        #[serde(default = "default_refresh_mhz")]
+        refresh_mhz: u32,
     },
     /// Host → guest: inject keyboard/pointer input (Milestone 4).
     InputEvent(InputPayload),
@@ -196,6 +207,8 @@ pub struct WaylandSessionInfo {
 /// Either side of the control plane: typed framing errors.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
+    #[error("invalid dirty rectangle stream: {0}")]
+    DirtyRect(&'static str),
     /// Need more bytes to complete the current frame.
     #[error("incomplete frame: {0} of {1} header/payload bytes available")]
     Incomplete(usize, usize),
@@ -259,8 +272,41 @@ pub fn decode_frame(buf: &[u8]) -> Result<(ControlMessage, usize), WireError> {
     if buf.len() < total {
         return Err(WireError::Incomplete(buf.len(), total));
     }
-    let msg = postcard::from_bytes::<ControlMessage>(&buf[CONTROL_HEADER_LEN..total])?;
+    let payload = &buf[CONTROL_HEADER_LEN..total];
+    let msg = match postcard::from_bytes::<ControlMessage>(payload) {
+        Ok(msg) => msg,
+        Err(postcard::Error::DeserializeUnexpectedEnd) => {
+            // Postcard struct fields are positional: serde's default alone
+            // does not supply a missing field at the end of a v1 payload.
+            decode_without_refresh(payload)?
+        }
+        Err(err) => return Err(err.into()),
+    };
     Ok((msg, total))
+}
+
+fn decode_without_refresh(payload: &[u8]) -> Result<ControlMessage, postcard::Error> {
+    let (variant, fields) = postcard::take_from_bytes::<u32>(payload)?;
+    let refresh_mhz = default_refresh_mhz();
+    // Enum indices are fixed by the append-only ControlMessage order above.
+    match variant {
+        6 => {
+            let ((session_id, width, height, scale_milli, no_audio), rest) =
+                postcard::take_from_bytes::<(String, u32, u32, u32, bool)>(fields)?;
+            if rest.is_empty() {
+                return Ok(ControlMessage::StartSession { session_id, width, height, scale_milli, no_audio, refresh_mhz });
+            }
+        }
+        10 => {
+            let ((width, height, scale_milli), rest) =
+                postcard::take_from_bytes::<(u32, u32, u32)>(fields)?;
+            if rest.is_empty() {
+                return Ok(ControlMessage::Resize { width, height, scale_milli, refresh_mhz });
+            }
+        }
+        _ => {}
+    }
+    Err(postcard::Error::DeserializeUnexpectedEnd)
 }
 
 /// Streaming frame reassembler for socket pumps: feed raw bytes, pull out
@@ -323,10 +369,74 @@ pub struct VideoFrameHeader {
     pub stride: u32,
     pub pixel_format: PixelFormat,
     pub compression: FrameCompression,
-    /// Number of dirty tile records following the header; 0 = full frame.
+    /// Number of dirty rectangles; 0 = full frame. A dirty payload decodes
+    /// to all rectangle headers first, followed by their packed pixels.
     pub rect_count: u16,
     /// Exact byte length of the raw/compressed payload that follows.
     pub payload_len: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRectHeader {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DirtyRectHeader {
+    pub fn to_bytes(self) -> [u8; DIRTY_RECT_HEADER_LEN] {
+        let mut bytes = [0; DIRTY_RECT_HEADER_LEN];
+        for (dst, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip([self.x, self.y, self.width, self.height]) {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
+        let bytes = bytes.first_chunk::<DIRTY_RECT_HEADER_LEN>()
+            .ok_or(WireError::DirtyRect("short rectangle header"))?;
+        let read = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"));
+        Ok(Self { x: read(0), y: read(4), width: read(8), height: read(12) })
+    }
+
+    pub fn pixel_len(self, frame_width: u32, frame_height: u32) -> Result<usize, WireError> {
+        if self.width == 0 || self.height == 0
+            || self.x.checked_add(self.width).is_none_or(|end| end > frame_width)
+            || self.y.checked_add(self.height).is_none_or(|end| end > frame_height)
+        {
+            return Err(WireError::DirtyRect("rectangle outside frame"));
+        }
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(WireError::DirtyRect("pixel size overflow"))
+    }
+}
+
+pub fn decode_dirty_rects(
+    payload: &[u8],
+    count: u16,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<Vec<(DirtyRectHeader, &[u8])>, WireError> {
+    if !(1..=MAX_DIRTY_RECTS).contains(&count) {
+        return Err(WireError::DirtyRect("unexpected rectangle count"));
+    }
+    let (headers, mut pixels) = payload.split_at_checked(usize::from(count) * DIRTY_RECT_HEADER_LEN)
+        .ok_or(WireError::DirtyRect("short header table"))?;
+    let mut rects = Vec::with_capacity(usize::from(count));
+    for bytes in headers.as_chunks::<DIRTY_RECT_HEADER_LEN>().0 {
+        let rect = DirtyRectHeader::from_bytes(bytes)?;
+        let (data, rest) = pixels.split_at_checked(rect.pixel_len(frame_width, frame_height)?)
+            .ok_or(WireError::DirtyRect("short pixel data"))?;
+        rects.push((rect, data));
+        pixels = rest;
+    }
+    if !pixels.is_empty() {
+        return Err(WireError::DirtyRect("extra pixel data"));
+    }
+    Ok(rects)
 }
 
 impl VideoFrameHeader {
@@ -466,6 +576,7 @@ mod tests {
                 height: 1080,
                 scale_milli: 1000,
                 no_audio: false,
+                refresh_mhz: 144_000,
             },
             ControlMessage::SessionStarted {
                 wayland_display: "wayland-0".into(),
@@ -485,6 +596,7 @@ mod tests {
                 width: 2560,
                 height: 1440,
                 scale_milli: 1500,
+                refresh_mhz: 120_000,
             },
             ControlMessage::InputEvent(InputPayload::Key {
                 code: 125,
@@ -524,6 +636,27 @@ mod tests {
             let (decoded, consumed) = decode_frame(&bytes).expect("decode");
             assert_eq!(consumed, bytes.len(), "consumed must cover whole frame");
             assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn v1_mode_messages_default_refresh_and_keep_legacy_prefix() {
+        let cases = [
+            (postcard::to_allocvec(&(6u32, "sway", 1920u32, 1080u32, 1000u32, false)).unwrap(),
+             ControlMessage::StartSession {
+                 session_id: "sway".into(), width: 1920, height: 1080,
+                 scale_milli: 1000, no_audio: false, refresh_mhz: default_refresh_mhz(),
+             }),
+            (postcard::to_allocvec(&(10u32, 800u32, 600u32, 1000u32)).unwrap(),
+             ControlMessage::Resize { width: 800, height: 600, scale_milli: 1000, refresh_mhz: default_refresh_mhz() }),
+        ];
+        for (payload, expected) in cases {
+            let mut frame = CONTROL_MAGIC.to_vec();
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&payload);
+            assert_eq!(decode_frame(&frame).unwrap().0, expected);
+            let encoded = encode_frame(&expected).unwrap();
+            assert!(encoded[CONTROL_HEADER_LEN..].starts_with(&payload));
         }
     }
 
@@ -748,6 +881,34 @@ mod tests {
         assert_eq!(bytes.len(), 32);
         assert_eq!(&bytes[0..4], &VIDEO_MAGIC);
         assert_eq!(VideoFrameHeader::from_bytes(&bytes).unwrap(), hdr);
+    }
+
+    #[test]
+    fn dirty_rect_payload_uses_a_header_table_then_packed_pixels() {
+        let first = DirtyRectHeader { x: 256, y: 3, width: 2, height: 1 };
+        let second = DirtyRectHeader { x: 10, y: 5, width: 1, height: 1 };
+        let mut payload = first.to_bytes().to_vec();
+        assert_eq!(&payload[..4], &[0, 1, 0, 0]);
+        payload.extend_from_slice(&second.to_bytes());
+        payload.extend_from_slice(&[7; 8]);
+        payload.extend_from_slice(&[9; 4]);
+        assert_eq!(decode_dirty_rects(&payload, 2, 300, 6).unwrap(),
+            vec![(first, &[7; 8][..]), (second, &[9; 4][..])]);
+        assert!(decode_dirty_rects(&payload[..payload.len() - 1], 2, 300, 6).is_err());
+        payload.push(0);
+        assert!(decode_dirty_rects(&payload, 2, 300, 6).is_err());
+    }
+
+    #[test]
+    fn dirty_rect_validation_rejects_out_of_bounds_and_overflow() {
+        let rect = DirtyRectHeader { x: 8, y: 8, width: 2, height: 2 };
+        assert_eq!(rect.pixel_len(10, 10).unwrap(), 16);
+        assert!(rect.pixel_len(9, 10).is_err());
+        assert!(rect.pixel_len(10, 9).is_err());
+        assert!(DirtyRectHeader { width: 0, ..rect }.pixel_len(10, 10).is_err());
+        assert!(DirtyRectHeader { x: u32::MAX, ..rect }.pixel_len(u32::MAX, 10).is_err());
+        assert!(DirtyRectHeader { x: 0, y: 0, width: u32::MAX, height: u32::MAX }
+            .pixel_len(u32::MAX, u32::MAX).is_err());
     }
 
     #[test]

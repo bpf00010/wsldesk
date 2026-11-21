@@ -2,9 +2,9 @@
 //!
 //! Data path: a dedicated blocking receiver thread pulls `b"WFRM"` frames
 //! from the guest over `VIDEO_PORT`, LZ4-decodes them, and publishes the
-//! LATEST frame into a slot (stale frames are overwritten — never queued —
-//! so backpressure can never accumulate multi-second video lag). The winit
-//! render loop uploads the latest frame via `queue.write_texture()` and
+//! updates into a bounded queue. Full frames supersede older work; damage
+//! updates are applied in order or merged into a complete image. The winit
+//! render loop uploads the pending regions via `queue.write_texture()` and
 //! draws it fullscreen with a minimal WGSL shader.
 //!
 //! Channel-order guarantee: the texture format is chosen to match the wire
@@ -19,45 +19,112 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use common::protocol::{ControlMessage, PixelFormat};
+use common::protocol::{ControlMessage, PixelFormat, VideoFrameHeader};
 use crate::input::{self, ControlPump};
-use crate::transport::{DecodedFrame, HvConnection, TransportError, VideoStream};
+use crate::transport::{DecodedFrame, FramePayload, HvConnection, TransportError, VideoStream};
 
-/// Latest-frame slot shared between the receiver thread and the render loop.
-///
-/// Writers always overwrite; readers take-and-clear. Dropping frames under
-/// backpressure is deliberate (no multi-second lag).
+/// Queue ordered damage until redraw. A complete image supersedes the queue.
 pub struct FramePublisher {
-    latest: Mutex<Option<DecodedFrame>>,
-    wake: OnceLock<winit::event_loop::EventLoopProxy<()>>,
+    pending: Mutex<PendingFrames>,
+    wake: OnceLock<winit::event_loop::EventLoopProxy<UserEvent>>,
+    redraw_pending: AtomicBool,
     closed: AtomicBool,
+}
+
+#[derive(Default)]
+struct PendingFrames {
+    canvas: Option<(VideoFrameHeader, Vec<u8>)>,
+    frames: Vec<DecodedFrame>,
+    rect_count: usize,
+    dirty_bytes: usize,
+}
+
+impl PendingFrames {
+    fn push(&mut self, frame: DecodedFrame) -> anyhow::Result<()> {
+        let header = frame.header;
+        match &frame.payload {
+            FramePayload::Full(pixels) => {
+                self.canvas = Some((header, pixels.clone()));
+                self.frames.clear();
+                self.rect_count = 0;
+                self.dirty_bytes = 0;
+                self.frames.push(frame);
+            }
+            FramePayload::DirtyRects(rects) => {
+                let (base, canvas) = self.canvas.as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("damage frame arrived before a full frame"))?;
+                anyhow::ensure!(
+                    (base.width, base.height, base.pixel_format) == (header.width, header.height, header.pixel_format),
+                    "damage frame changed layout without a full frame"
+                );
+                for rect in rects {
+                    let region = rect.region;
+                    let row_bytes = region.width as usize * 4;
+                    for (row, pixels) in rect.pixels.chunks_exact(row_bytes).enumerate() {
+                        let start = (region.y as usize + row) * header.stride as usize + region.x as usize * 4;
+                        canvas[start..start + row_bytes].copy_from_slice(pixels);
+                    }
+                }
+                self.rect_count += rects.len();
+                self.dirty_bytes += frame.pixel_len();
+                // Bound both the number of rectangle uploads and their memory.
+                // The CPU canvas includes every previous delta, including those
+                // the renderer may already have uploaded.
+                if self.rect_count > 64 || self.dirty_bytes > canvas.len() {
+                    self.frames.clear();
+                    self.rect_count = 0;
+                    self.dirty_bytes = 0;
+                    self.frames.push(DecodedFrame {
+                        header: VideoFrameHeader { rect_count: 0, ..header },
+                        payload: FramePayload::Full(canvas.clone()),
+                    });
+                } else {
+                    self.frames.push(frame);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+enum UserEvent {
+    FrameReady,
+    VideoClosed,
 }
 
 impl FramePublisher {
     pub fn new() -> Self {
         Self {
-            latest: Mutex::new(None),
+            pending: Mutex::new(PendingFrames::default()),
             wake: OnceLock::new(),
+            redraw_pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
     }
 
-    /// Overwrite the latest frame and wake the render thread.
-    pub fn publish(&self, frame: DecodedFrame) {
+    /// Queue the frame and wake the render thread once per pending batch.
+    pub fn publish(&self, frame: DecodedFrame) -> anyhow::Result<()> {
         if self.closed.load(Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
-        let was_empty = self.latest.lock().expect("frame lock").replace(frame).is_none();
-        // Winit sleeps independently of this mutex. A condition variable
-        // cannot wake its Win32 message loop. Coalesce frames until consumed.
-        if was_empty {
-            self.wake_event_loop();
+        let should_wake = {
+            let mut pending = self.pending.lock().expect("frame lock");
+            pending.push(frame)?;
+            !self.redraw_pending.swap(true, Ordering::Relaxed)
+        };
+        if should_wake {
+            self.wake_event_loop(UserEvent::FrameReady);
         }
+        Ok(())
     }
 
-    /// Non-blocking take of the newest frame (if any).
-    pub fn try_take(&self) -> Option<DecodedFrame> {
-        self.latest.lock().expect("frame lock").take()
+    /// Take the pending updates in stream order.
+    pub fn take_updates(&self) -> Vec<DecodedFrame> {
+        let mut pending = self.pending.lock().expect("frame lock");
+        self.redraw_pending.store(false, Ordering::Relaxed);
+        pending.rect_count = 0;
+        pending.dirty_bytes = 0;
+        std::mem::take(&mut pending.frames)
     }
 
     /// True once the receiver wants the render loop to wind down.
@@ -67,18 +134,19 @@ impl FramePublisher {
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.wake_event_loop();
+        self.wake_event_loop(UserEvent::VideoClosed);
     }
 
-    fn wake_event_loop(&self) {
+    fn wake_event_loop(&self, event: UserEvent) {
         if let Some(proxy) = self.wake.get() {
-            let _ = proxy.send_event(());
+            let _ = proxy.send_event(event);
         }
     }
 
-    /// Newest frame without consuming it (for the redraw pump).
+    /// Check whether the live test has received its first frame.
+    #[cfg(test)]
     pub fn peek(&self) -> bool {
-        self.latest.lock().expect("frame lock").is_some()
+        !self.pending.lock().expect("frame lock").frames.is_empty()
     }
 }
 
@@ -86,12 +154,33 @@ impl FramePublisher {
 #[derive(Debug, Default, Clone)]
 pub struct VideoStats {
     pub frames: u64,
+    pub full_frames: u64,
+    pub dirty_frames: u64,
+    pub dirty_wire_bytes: u64,
     pub seconds: f64,
     pub wire_bytes: u64,
     pub raw_bytes: u64,
     pub width: u32,
     pub height: u32,
     pub pixel_format: Option<PixelFormat>,
+}
+
+impl VideoStats {
+    fn record(&mut self, frame: &DecodedFrame) {
+        self.frames += 1;
+        self.wire_bytes += frame.wire_len() as u64;
+        self.raw_bytes += frame.pixel_len() as u64;
+        self.width = frame.header.width;
+        self.height = frame.header.height;
+        self.pixel_format = Some(frame.header.pixel_format);
+        match frame.payload {
+            FramePayload::Full(_) => self.full_frames += 1,
+            FramePayload::DirtyRects(_) => {
+                self.dirty_frames += 1;
+                self.dirty_wire_bytes += frame.wire_len() as u64;
+            }
+        }
+    }
 }
 
 /// Spawn the blocking receiver thread: connect (with retry while the guest
@@ -118,15 +207,16 @@ pub fn spawn_video_receiver(
             eprintln!("video receiver: connected to AF_VSOCK {VIDEO_PORT}");
             let mut local = VideoStats::default();
             while !stop.load(Ordering::SeqCst) && !publisher.is_closed() {
+                if !stream.wait_readable(Duration::from_millis(100)) {
+                    continue;
+                }
                 match stream.recv_frame() {
                     Ok(frame) => {
-                        local.frames += 1;
-                        local.raw_bytes += frame.pixels.len() as u64;
-                        local.wire_bytes += frame.wire_len() as u64;
-                        local.width = frame.header.width;
-                        local.height = frame.header.height;
-                        local.pixel_format = Some(frame.header.pixel_format);
-                        publisher.publish(frame);
+                        local.record(&frame);
+                        if let Err(err) = publisher.publish(frame) {
+                            eprintln!("video receiver: {err}");
+                            break;
+                        }
                     }
                     Err(TransportError::Io(err))
                         if err.kind() == std::io::ErrorKind::TimedOut =>
@@ -246,8 +336,8 @@ struct ViewportState {
     surface_config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    texture: Option<(wgpu::Texture, wgpu::BindGroup, u32, u32, wgpu::TextureFormat)>,
+    samplers: [wgpu::Sampler; 2],
+    texture: Option<(wgpu::Texture, [wgpu::BindGroup; 2], u32, u32, wgpu::TextureFormat)>,
     title_prefix: String,
     fps_window_start: Instant,
     fps_frames: u64,
@@ -274,24 +364,33 @@ struct ViewportApp {
     /// grab toggle.
     rctrl_hold_consumed: bool,
     pending_resize: Option<(u32, u32, u32)>,
+    last_resize: (u32, u32, u32),
+    refresh_mhz: u32,
+    default_refresh: bool,
     resize_deadline: Option<Instant>,
     fullscreen: bool,
     last_title: String,
     clipboard_hash: String,
 }
 
-impl winit::application::ApplicationHandler for ViewportApp {
-    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, _: ()) {
-        if self.publisher.is_closed() {
-            self.teardown();
-            event_loop.exit();
-        } else if let Some(state) = &self.state {
-            state.window.request_redraw();
+impl winit::application::ApplicationHandler<UserEvent> for ViewportApp {
+    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::FrameReady => {
+                if let Some(state) = &self.state {
+                    state.window.request_redraw();
+                }
+            }
+            UserEvent::VideoClosed => {
+                self.teardown();
+                event_loop.exit();
+            }
         }
     }
 
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        match create_viewport(event_loop, &self.title_prefix) {
+        let (width, height, _) = self.last_resize;
+        match create_viewport(event_loop, &self.title_prefix, width, height) {
             Ok(state) => {
                 // Start the keyboard grab once we know our window handle.
                 let hwnd = window_hwnd_usable(&state.window);
@@ -308,7 +407,18 @@ impl winit::application::ApplicationHandler for ViewportApp {
                         .window
                         .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                 }
+                if self.default_refresh {
+                    if let Some(refresh) = state.window.current_monitor()
+                        .and_then(|monitor| monitor.refresh_rate_millihertz())
+                    {
+                        eprintln!("DX12 monitor: {refresh} mHz; guest default: {} mHz (override with --fps)", self.refresh_mhz);
+                    }
+                }
+                let size = state.window.inner_size();
+                let scale = state.window.scale_factor();
+                state.window.request_redraw();
                 self.state = Some(state);
+                self.queue_resize(size, scale);
                 self.refresh_title();
             }
             Err(err) => {
@@ -344,25 +454,26 @@ impl winit::application::ApplicationHandler for ViewportApp {
                     *self.output_size.lock().expect("output size lock") = (*width, *height);
                 }
             }
-            winit::event::WindowEvent::Resized(size) => {
+            winit::event::WindowEvent::Resized(_) | winit::event::WindowEvent::ScaleFactorChanged { .. } => {
+                let (size, scale) = match event {
+                    winit::event::WindowEvent::Resized(size) => (size, state.window.scale_factor()),
+                    winit::event::WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        (state.window.inner_size(), scale_factor)
+                    }
+                    _ => unreachable!(),
+                };
                 if size.width > 0 && size.height > 0 {
                     // Debounce: reconfigure the swapchain immediately, but
                     // only forward to the guest after ~150ms of quiet, with
                     // even, sane dimensions and the real monitor scale.
-                    let mut cfg = state.surface_config.clone();
-                    cfg.width = size.width;
-                    cfg.height = size.height;
-                    state.surface_config = cfg.clone();
-                    state.surface.configure(&state.device, &cfg);
-                    let scale_milli = (state.window.scale_factor() * 1000.0).round() as u32;
-                    self.pending_resize = Some((
-                        clamp_resize_dim(size.width),
-                        clamp_resize_dim(size.height),
-                        scale_milli,
-                    ));
-                    self.resize_deadline = Some(Instant::now() + Duration::from_millis(150));
+                    if (state.surface_config.width, state.surface_config.height) != (size.width, size.height) {
+                        state.surface_config.width = size.width;
+                        state.surface_config.height = size.height;
+                        state.surface.configure(&state.device, &state.surface_config);
+                    }
+                    state.window.request_redraw();
+                    self.queue_resize(size, scale);
                 }
-                state.window.request_redraw();
             }
             winit::event::WindowEvent::KeyboardInput {
                 event:
@@ -565,7 +676,7 @@ impl winit::application::ApplicationHandler for ViewportApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         // 1. Control-plane inbound: guest clipboard → Windows clipboard.
         for msg in self.pump.drain_inbound() {
             match msg {
@@ -602,21 +713,36 @@ impl winit::application::ApplicationHandler for ViewportApp {
                     width: w,
                     height: h,
                     scale_milli: scale,
+                    refresh_mhz: self.refresh_mhz,
                 });
+                self.last_resize = (w, h, scale);
                 self.pending_resize = None;
                 self.resize_deadline = None;
             }
         }
-        // 4. Redraw when a fresh frame landed (sender caps at ~60 FPS).
-        if self.publisher.peek() {
-            if let Some(state) = self.state.as_ref() {
-                state.window.request_redraw();
-            }
-        }
+        use winit::event_loop::ControlFlow;
+        event_loop.set_control_flow(self.resize_deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }
 
 impl ViewportApp {
+    fn queue_resize(&mut self, size: winit::dpi::PhysicalSize<u32>, scale: f64) {
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let mode = (
+            size.width.clamp(320, 7680) & !1,
+            size.height.clamp(240, 7680) & !1,
+            (scale * 1000.0).round() as u32,
+        );
+        if mode == self.last_resize {
+            self.pending_resize = None;
+            self.resize_deadline = None;
+        } else if self.pending_resize != Some(mode) {
+            self.pending_resize = Some(mode);
+            self.resize_deadline = Some(Instant::now() + Duration::from_millis(150));
+        }
+    }
     /// Send StopSession, wait for the confirmation, and shut the pump down.
     fn teardown(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
@@ -663,11 +789,6 @@ impl ViewportApp {
     }
 }
 
-/// Clamp a resize dimension to even values within sane bounds.
-fn clamp_resize_dim(v: u32) -> u32 {
-    (v.max(320) & !1).min(7680)
-}
-
 /// HWND of the viewport window as a usize slot for the LL keyboard hook
 /// (winit 0.30 exposes the raw window handle; read it through rwh 0.6).
 fn window_hwnd_usable(window: &winit::window::Window) -> usize {
@@ -684,10 +805,12 @@ fn window_hwnd_usable(window: &winit::window::Window) -> usize {
 fn create_viewport(
     event_loop: &winit::event_loop::ActiveEventLoop,
     title_prefix: &str,
+    width: u32,
+    height: u32,
 ) -> anyhow::Result<ViewportState> {
     let attrs = winit::window::Window::default_attributes()
         .with_title(title_prefix)
-        .with_inner_size(winit::dpi::LogicalSize::new(1280.0f64, 720.0f64));
+        .with_inner_size(winit::dpi::PhysicalSize::new(width, height));
     let window = Arc::new(event_loop.create_window(attrs)?);
 
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
@@ -710,6 +833,13 @@ fn create_viewport(
 
     let size = window.inner_size();
     let caps = surface.get_capabilities(&adapter);
+    let present_mode = [
+        wgpu::PresentMode::Mailbox,
+        wgpu::PresentMode::AutoNoVsync,
+        wgpu::PresentMode::Immediate,
+        wgpu::PresentMode::Fifo,
+    ].into_iter().find(|mode| caps.present_modes.contains(mode)).unwrap_or(wgpu::PresentMode::Fifo);
+    eprintln!("DX12 present mode: {present_mode:?}");
     // Prefer Bgra8Unorm (identity pass-through); the texture format is always
     // matched to whatever surface format we settle on.
     let surface_format = caps
@@ -724,7 +854,7 @@ fn create_viewport(
         format: surface_format,
         width: size.width.max(1),
         height: size.height.max(1),
-        present_mode: wgpu::PresentMode::AutoVsync,
+        present_mode,
         desired_maximum_frame_latency: 2,
         alpha_mode: caps.alpha_modes[0],
         view_formats: vec![],
@@ -786,15 +916,15 @@ fn create_viewport(
         multiview: None,
         cache: None,
     });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+    let samplers = [wgpu::FilterMode::Nearest, wgpu::FilterMode::Linear].map(|filter| device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("wsldesk-sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
         address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
+        mag_filter: filter,
+        min_filter: filter,
         ..Default::default()
-    });
+    }));
 
     Ok(ViewportState {
         window,
@@ -804,7 +934,7 @@ fn create_viewport(
         surface_config,
         pipeline,
         bind_group_layout,
-        sampler,
+        samplers,
         texture: None,
         title_prefix: title_prefix.to_string(),
         fps_window_start: Instant::now(),
@@ -846,12 +976,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Upload the newest frame (if any) and present one surface frame.
-fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow::Result<()> {
-    let Some(frame) = publisher.try_take() else {
-        return Ok(()); // nothing new — keep the last presented frame
-    };
-    let DecodedFrame { header, pixels } = frame;
+fn upload_updates(state: &mut ViewportState, updates: Vec<DecodedFrame>) -> anyhow::Result<()> {
+    let Some(last) = updates.last() else { return Ok(()); };
+    let header = last.header;
 
     // Recreate the texture when resolution/format changes (sway resize,
     // session switch). Texture format matches the WIRE byte order; the
@@ -866,6 +993,10 @@ fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow
         None => true,
     };
     if needs_recreate {
+        anyhow::ensure!(
+            matches!(updates.first().map(|frame| &frame.payload), Some(FramePayload::Full(_))),
+            "new texture layout requires a full frame"
+        );
         let texture = state.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("wsldesk-frame-texture"),
             size: wgpu::Extent3d {
@@ -881,7 +1012,7 @@ fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = state.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_groups = state.samplers.each_ref().map(|sampler| state.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wsldesk-frame-bind"),
             layout: &state.bind_group_layout,
             entries: &[
@@ -891,35 +1022,54 @@ fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&state.sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
-        });
-        state.texture = Some((texture, bind_group, header.width, header.height, wire_format));
+        }));
+        state.texture = Some((texture, bind_groups, header.width, header.height, wire_format));
     }
 
-    {
-        let (texture, bind_group, _, _, _) = state.texture.as_ref().expect("texture just created");
+    let (texture, ..) = state.texture.as_ref().expect("texture initialized");
+    let write = |x, y, width, height, pixels: &[u8]| {
         state.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
-            &pixels,
+            pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(header.width * 4),
-                rows_per_image: Some(header.height),
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
             },
             wgpu::Extent3d {
-                width: header.width,
-                height: header.height,
+                width,
+                height,
                 depth_or_array_layers: 1,
             },
         );
+    };
+    for update in updates {
+        match update.payload {
+            FramePayload::Full(pixels) => write(0, 0, header.width, header.height, &pixels),
+            FramePayload::DirtyRects(rects) => {
+                for rect in rects {
+                    let region = rect.region;
+                    write(region.x, region.y, region.width, region.height, &rect.pixels);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
+/// Apply all pending deltas, then present once.
+fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow::Result<()> {
+    upload_updates(state, publisher.take_updates())?;
+    let Some((_, bind_groups, width, height, _)) = state.texture.as_ref() else { return Ok(()); };
+    {
         let surface_texture = match state.surface.get_current_texture() {
             Ok(texture) => texture,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -928,10 +1078,16 @@ fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow
                     state.surface_config.width = size.width;
                     state.surface_config.height = size.height;
                     state.surface.configure(&state.device, &state.surface_config);
+                    state.window.request_redraw();
                 }
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => {
+                if !state.window.is_minimized().unwrap_or(false) {
+                    state.window.request_redraw();
+                }
+                return Ok(());
+            }
             Err(err) => return Err(err.into()),
         };
         let view = surface_texture
@@ -956,7 +1112,8 @@ fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&state.pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
+            let scaling = (*width, *height) != (state.surface_config.width, state.surface_config.height);
+            pass.set_bind_group(0, &bind_groups[usize::from(scaling)], &[]);
             pass.draw(0..3, 0..1);
         }
         state.queue.submit([encoder.finish()]);
@@ -987,14 +1144,18 @@ fn render_frame(state: &mut ViewportState, publisher: &FramePublisher) -> anyhow
 /// threads) so input forwarding never stalls DX12 rendering; the viewport's
 /// idle timeout is infinite (an idle user must never lose the control
 /// channel) and teardown is owned by window close / Ctrl+C / focus-loss.
+#[allow(clippy::too_many_arguments)]
 pub fn run_viewport(
     distro: &'static str,
     title_prefix: &str,
     conn: HvConnection,
     publisher: Arc<FramePublisher>,
     fullscreen: bool,
+    initial_mode: (u32, u32, u32),
+    refresh_mhz: u32,
+    default_refresh: bool,
 ) -> anyhow::Result<()> {
-    let event_loop = winit::event_loop::EventLoop::new()?;
+    let event_loop = winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let _ = publisher.wake.set(event_loop.create_proxy());
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(VideoStats::default()));
@@ -1026,6 +1187,9 @@ pub fn run_viewport(
         grab_chord_held: false,
         rctrl_hold_consumed: false,
         pending_resize: None,
+        last_resize: initial_mode,
+        refresh_mhz,
+        default_refresh,
         resize_deadline: None,
         fullscreen,
         last_title: title_prefix.to_string(),
@@ -1061,126 +1225,136 @@ pub fn run_viewport(
 // `--headless-frames N` diagnostics (no window — CI/smoke verification)
 // ---------------------------------------------------------------------------
 
-/// Receive real frames directly (no window, no publisher), verifying each
-/// is non-empty and correctly sized. Sequence (M4B verification):
-/// 1. collect `pre_inject_frames` (default 3) at the requested geometry;
-/// 2. call `inject` once (test InputEvent + live Resize);
-/// 3. keep receiving until at least one frame arrives at the post-resize
-///    target geometry — up to `max_frames` total (30) so normal mode-switch
-///    latency can't cause a false negative.
-///
-/// Returns stats, the verified-frames count, and whether the live resize
-/// flip was observed.
+/// Drive cursor damage without a viewport and verify both layouts.
 pub fn receive_headless_frames(
     distro: &str,
-    pre_inject_frames: u64,
-    resize_target: Option<(u32, u32)>,
+    sample_frames: u64,
+    initial_size: (u32, u32),
+    scale_milli: u32,
+    refresh_mhz: u32,
+    conn: &HvConnection,
     stop: &AtomicBool,
-    inject: Option<&dyn Fn(u64)>,
 ) -> anyhow::Result<(VideoStats, u64, bool)> {
+    use common::protocol::InputPayload;
+
     let stream = connect_video_with_retry(distro, stop)?;
-    eprintln!(
-        "headless: connected to AF_VSOCK {VIDEO_PORT}, receiving {pre_inject_frames} frames, \
-         then waiting for the live resize to land…"
-    );
+    let resize_target = (800, 600);
     let started = Instant::now();
-    let max_frames = 30;
+    let deadline = started + Duration::from_secs(30);
     let mut stats = VideoStats::default();
-    let mut checksum_ok = 0u64;
-    let mut saw_initial_geometry: Option<(u32, u32)> = None;
-    let mut resize_flipped = false;
-    let mut injected = false;
-    while stats.frames < max_frames {
-        if stop.load(Ordering::SeqCst) {
-            anyhow::bail!("headless receive stopped early");
-        }
-        // Idle timeouts are transient (the sender caps at ~60 FPS but pauses
-        // during output reconfiguration) — keep waiting while not stopped.
-        let frame = match stream.recv_frame() {
-            Ok(frame) => frame,
-            Err(TransportError::Io(err))
-                if err.kind() == std::io::ErrorKind::TimedOut && !stop.load(Ordering::SeqCst) =>
-            {
-                continue;
+    let mut sample = VideoStats::default();
+    let mut base = None;
+    let mut first_frame_at = None;
+    let mut sample_started_at = None;
+    let mut resize_sent_at = None;
+    let mut resized_at = None;
+    let mut motion_at = started;
+    let motion_period = Duration::from_nanos(1_000_000_000_000 / u64::from(refresh_mhz));
+    let mut motion = 0u32;
+
+    eprintln!("headless: measuring {sample_frames} frames with synthetic cursor motion");
+    while Instant::now() < deadline {
+        anyhow::ensure!(!stop.load(Ordering::SeqCst), "headless receive stopped early");
+        let now = Instant::now();
+        if let Some(at) = resized_at {
+            if now - at >= Duration::from_millis(2500) {
+                break;
             }
-            Err(err) => return Err(err.into()),
-        };
-        let expected_len = frame.header.width as usize * 4 * frame.header.height as usize;
-        let nonzero = frame.pixels.iter().any(|&b| b != 0);
-        if nonzero && frame.pixels.len() == expected_len {
-            checksum_ok += 1;
+        } else if resize_sent_at.is_some_and(|at| now - at >= Duration::from_secs(5)) {
+            break;
+        }
+        if now >= motion_at {
+            let (width, height, _) = base.unwrap_or((initial_size.0, initial_size.1, PixelFormat::Bgra8888));
+            motion = motion.wrapping_add(11);
+            conn.send_msg(&ControlMessage::InputEvent(InputPayload::PointerMotionAbsolute {
+                x: width / 4 + motion % (width / 2).max(1),
+                y: height / 2,
+                width,
+                height,
+            }))?;
+            motion_at = now + motion_period;
+        }
+        // No packets are expected while the scene is idle. Wait for the
+        // first byte before entering a framed read with the socket timeout.
+        if !stream.wait_readable(Duration::from_millis(2)) {
+            continue;
+        }
+        let frame = stream.recv_frame()?;
+        let geometry = (frame.header.width, frame.header.height);
+        let layout = (geometry.0, geometry.1, frame.header.pixel_format);
+        if matches!(frame.payload, FramePayload::Full(_)) {
+            base = Some(layout);
         } else {
-            eprintln!(
-                "headless: frame {} suspect (len {} vs {expected_len}, non-zero content: {nonzero})",
-                stats.frames,
-                frame.pixels.len()
-            );
+            anyhow::ensure!(base == Some(layout), "dirty frame without a matching full frame");
         }
-        stats.frames += 1;
-        stats.raw_bytes += frame.pixels.len() as u64;
-        stats.wire_bytes += frame.wire_len() as u64;
-        stats.width = frame.header.width;
-        stats.height = frame.header.height;
-        stats.pixel_format = Some(frame.header.pixel_format);
 
-        if stats.frames == pre_inject_frames {
-            saw_initial_geometry = Some((frame.header.width, frame.header.height));
-            if let Some(inject) = inject {
+        let now = Instant::now();
+        first_frame_at.get_or_insert(now);
+        stats.record(&frame);
+        if resize_sent_at.is_none() && geometry == initial_size {
+            let first = *sample_started_at.get_or_insert(now);
+            sample.record(&frame);
+            if sample.frames == sample_frames {
+                let fps = sample.frames.saturating_sub(1) as f64 / (now - first).as_secs_f64().max(0.000_001);
                 eprintln!(
-                    "headless: injecting test InputEvent + Resize after {} frames at {}x{}…",
-                    stats.frames, frame.header.width, frame.header.height
+                    "headless: initial {}x{}: {:.1} FPS, {} full / {} dirty, mean dirty frame {:.0} wire bytes",
+                    geometry.0, geometry.1, fps, sample.full_frames, sample.dirty_frames,
+                    sample.dirty_wire_bytes as f64 / sample.dirty_frames.max(1) as f64,
                 );
-                inject(stats.frames);
-                injected = true;
-            }
-        }
-
-        // Post-inject: wait until the geometry flips to the resize target
-        // (up to max_frames — mode changes take a few compositor cycles),
-        // then hold ~2.5s so the guest's 2s input-telemetry window elapses
-        // (proving input routing on the daemon log).
-        if injected {
-            if let Some(target) = resize_target {
-                if (frame.header.width, frame.header.height) == target {
-                    resize_flipped = true;
-                    eprintln!(
-                        "headless: live resize VERIFIED — frame {} arrived at {}x{}",
-                        stats.frames, target.0, target.1
-                    );
-                    // Hold the session open so the guest's 2s telemetry
-                    // window fires and the injected input is provably routed.
-                    let hold_deadline = Instant::now() + Duration::from_millis(2500);
-                    while Instant::now() < hold_deadline && stats.frames < max_frames + 60 {
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        match stream.recv_frame() {
-                            Ok(f) => {
-                                stats.frames += 1;
-                                stats.raw_bytes += f.pixels.len() as u64;
-                                stats.wire_bytes += f.wire_len() as u64;
-                                stats.width = f.header.width;
-                                stats.height = f.header.height;
-                                stats.pixel_format = Some(f.header.pixel_format);
-                            }
-                            Err(TransportError::Io(err))
-                                if err.kind() == std::io::ErrorKind::TimedOut =>
-                            {
-                                continue;
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
-                    }
+                if geometry == resize_target {
                     break;
                 }
-            } else {
-                break; // no resize verification requested — enough frames
+                conn.send_msg(&ControlMessage::Resize {
+                    width: resize_target.0,
+                    height: resize_target.1,
+                    scale_milli,
+                    refresh_mhz,
+                })?;
+                resize_sent_at = Some(now);
             }
-        } else if resize_target.is_none() && stats.frames >= pre_inject_frames + 7 {
-            break; // non-4B headless mode: stop after a few extra frames
+        } else if resize_sent_at.is_some() && resized_at.is_none() && geometry == resize_target {
+            anyhow::ensure!(frame.header.rect_count == 0, "resize did not have a full base frame");
+            resized_at = Some(now);
+            eprintln!("headless: live resize VERIFIED — full frame {} at 800x600", stats.frames);
         }
     }
-    let _ = saw_initial_geometry;
-    stats.seconds = started.elapsed().as_secs_f64();
-    Ok((stats, checksum_ok, resize_flipped))
+    anyhow::ensure!(sample.frames >= sample_frames, "not enough frames at the requested size before the headless deadline");
+    stats.seconds = first_frame_at.unwrap_or(started).elapsed().as_secs_f64();
+    let validated = stats.frames;
+    Ok((stats, validated, resized_at.is_some()))
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+    use crate::transport::DirtyRect;
+    use common::protocol::{DirtyRectHeader, FrameCompression};
+
+    #[test]
+    fn queue_overflow_preserves_disjoint_and_overlapping_updates() {
+        let header = VideoFrameHeader {
+            frame_id: 0, width: 80, height: 1, stride: 320, pixel_format: PixelFormat::Bgra8888,
+            compression: FrameCompression::Raw, rect_count: 0, payload_len: 320,
+        };
+        let publisher = FramePublisher::new();
+        publisher.publish(DecodedFrame { header, payload: FramePayload::Full(vec![0; 320]) }).unwrap();
+        assert_eq!(publisher.take_updates().len(), 1);
+        for index in 0..65 {
+            let x = index % 64;
+            publisher.publish(DecodedFrame {
+                header: VideoFrameHeader { frame_id: u64::from(index + 1), rect_count: 1, ..header },
+                payload: FramePayload::DirtyRects(vec![DirtyRect {
+                    region: DirtyRectHeader { x, y: 0, width: 1, height: 1 },
+                    pixels: vec![index as u8 + 1; 4],
+                }]),
+            }).unwrap();
+        }
+        let updates = publisher.take_updates();
+        assert_eq!(updates.len(), 1);
+        let FramePayload::Full(canvas) = &updates[0].payload else { panic!("expected compacted full frame") };
+        assert_eq!(&canvas[..4], &[65; 4]);
+        assert_eq!(&canvas[4..8], &[2; 4]);
+        assert_eq!(&canvas[252..256], &[64; 4]);
+        assert_eq!(&canvas[256..], &[0; 64]);
+    }
 }

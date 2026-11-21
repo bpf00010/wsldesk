@@ -260,7 +260,8 @@ async fn handle_message(writer: &SharedWriter, msg: ControlMessage) -> bool {
             height,
             scale_milli,
             no_audio,
-        } => start_session(writer, session_id, width, height, scale_milli, no_audio).await,
+            refresh_mhz,
+        } => start_session(writer, session_id, width, height, scale_milli, no_audio, refresh_mhz).await,
         ControlMessage::StopSession { session_id } => stop_session(writer, session_id).await,
         // 4B: interactive traffic — route into the active session's bridge.
         ControlMessage::InputEvent(_)
@@ -337,6 +338,7 @@ async fn start_session(
     height: u32,
     scale_milli: u32,
     no_audio: bool,
+    refresh_mhz: u32,
 ) -> bool {
     if active_slot().lock().expect("active lock").is_some() {
         let _ = send_msg(
@@ -454,6 +456,7 @@ async fn start_session(
                 crate::wayland_bridge::SessionChannels {
                     input_rx,
                     clipboard_tx: clip_tx,
+                    refresh_mhz,
                 },
                 width,
                 height,
@@ -689,6 +692,7 @@ mod tests {
                 height: 1,
                 scale_milli: 1000,
                 no_audio: false,
+                refresh_mhz: common::protocol::default_refresh_mhz(),
             },
             ControlMessage::SessionStarted {
                 wayland_display: "wayland-0".into(),
@@ -708,6 +712,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 scale_milli: 1000,
+                refresh_mhz: common::protocol::default_refresh_mhz(),
             },
             ControlMessage::InputEvent(common::protocol::InputPayload::Key {
                 code: 1,

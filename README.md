@@ -9,6 +9,12 @@ Unfortunately performance wise it is currently a mess in a heavy prerelease stat
 
 From PowerShell, use a release checkout with `dist/wsldesk.exe` or build it from source first. The installer copies one executable to your user profile and adds it to your user PATH.
 
+The [v0.2.0 preview](https://github.com/bpf00010/wsldesk/releases/tag/v0.2.0) includes
+damage-only updates and an adjustable guest refresh rate. Close the old desktop
+before upgrading, then run `wsldesk up` with the new executable. It installs the
+matching embedded guest. Hosts and guests from v0.1.0 and v0.2.0 use different
+protocol versions.
+
 ```powershell
 .\scripts\install.ps1
 wsldesk doctor
@@ -57,23 +63,24 @@ Use Rust with the Windows MSVC toolchain and install the guest target with `rust
 Run `wsldesk doctor --distro Ubuntu` for WSL version, systemd, GPU, guest binary, and session checks. If no desktop is detected, run `wsldesk setup --install-desktop`. If a session uses pixman, its compositor is rendering in software. If Win shortcuts reach Windows, click inside WSLDesk and check the grab indicator in the title.
 
 
-##Roadmap
+## Performance in v0.2.0
 
+- `wsldesk up --fps 144` requests a 144 Hz guest output mode. The supported range
+  is 30–240 Hz and the default is 144 Hz. Delivered frame rate depends on
+  compositor load, scene damage, transport, and the Windows display.
+- The guest reuses a shared-memory capture buffer and waits for Wayland damage.
+  Small changes travel as dirty rectangles, and DX12 uploads just those regions.
+  Resize starts with a complete frame. Where supported, DX12 prefers Mailbox
+  presentation and uses nearest-neighbor sampling when frame and window sizes match.
 
-### High-Refresh & Frame Pacing (Breaking the 60 FPS Cap)
-- **True 120–144 Hz Output & Capture Pacing:** Replace the hardcoded `60000` mHz mode in `zwlr_output_configuration_head_v1::set_custom_mode` with a configurable `--fps` / monitor-matched refresh rate (up to `144000` mHz+), and uncap the guest screencopy loop from its 60 FPS ceiling.
-- **Persistent Reusable `wl_shm` Buffer Pool:** Eliminate per-frame `memfd_create` / `ftruncate` / `mmap` / `wl_shm_pool` creation and teardown in `capture_one_frame` by reusing a single mapped SHM pool (reallocating only on resize) to remove micro-stutters and kernel syscall overhead.
-- **DX12 Low-Latency Presentation:** Switch the `wgpu` swapchain from VSync-bound `Fifo` to `Mailbox` / `AutoNoVsync` where supported, and decouple texture uploads (`queue.write_texture`) from `winit` event-loop scheduling to cut frame drops and pacing jitter.
+## Roadmap
 
 ### High-Resolution (1440p / 4K) Performance & Bandwidth
-- **Frame Updates (`copy_with_damage`):** Upgrade from blind full-frame `zwlr_screencopy` polling to `copy_with_damage` with dirty-rectangle / tile diffing (leveraging `VideoFrameHeader.rect_count`), avoiding re-compressing and uploading 14–33 MB raw frames on every tick at 1440p/4K.
-- **Idle Frame Suppression:** Skip shipping unchanged frames when the compositor reports zero damage instead of saturating CPU and VMBus with redundant full-screen LZ4 payloads.
 - **Multi-Threaded Compression & Adaptive Quality:** Parallelize LZ4 tile compression across cores (and evaluate optional hardware/low-latency video codecs for motion-heavy workloads like browser video playback).
 - **GPU-Accelerated Guest Compositing:** Investigate alternatives to the current `WLR_RENDERER=pixman` software compositing fallback (currently required because WSL2's `/dev/dri/renderD128` `dxg` DRM layer rejects `DRM_IOCTL_MODE_CREATE_DUMB` / GBM buffer allocation for headless outputs), freeing CPU headroom at high resolutions.
-- **Fractional HiDPI & Crisp Scaling:** Improve `scale_milli` negotiation and viewport aspect/DPI synchronization so 1440p and 4K displays stay sharp without blurry upscaling or resize flicker.
+- **Fractional HiDPI:** Expand testing across mixed-DPI monitors and 4K displays.
 
 ### Input, Clipboard & Usability Bug Fixes
-- **Fix Mouse Scroll Wheel:** Properly emit `zwlr_virtual_pointer_v1::axis_source` (`Wheel`), `axis_discrete`, calibrated `axis` deltas (both vertical and horizontal), and `frame()` so scrolling works reliably in Chrome, `foot`, and GTK/Qt apps.
 - **Lower Input Latency:** Replace the 2 ms `select()` polling interval in `ControlPump` with event-driven signaling, fix remaining modifier/grab edge cases (`Alt+Tab` and focus transitions), and add configurable grab hotkeys.
 - **Richer Clipboard Sync:** Extend Win32 ↔ `zwlr_data_control_v1` beyond `text/plain;charset=utf-8` to support images (`image/png`) and richer MIME types cleanly.
 - **Session Persistence & Reattach (`wsldesk attach`):** Allow detaching and reattaching the Windows viewport without killing open Linux apps, alongside graceful recovery from transient VMBus hiccups.
