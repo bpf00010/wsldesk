@@ -1,0 +1,12 @@
+# Static musl guest linking from any host (Windows cross-compile): rust-lld is
+# self-contained and the musl rust-std ships crt objects + libc.a, so a 100%
+# pure-Rust binary links without a gcc-musl cross toolchain.
+#
+# BOTH settings below are scoped strictly to [target.x86_64-unknown-linux-musl]:
+# the Windows host (x86_64-pc-windows-msvc) is unaffected, and no global
+# rustflags exist that could leak into other targets.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+# +crt-static is the musl default, but set it explicitly so the static link
+# guarantee does not depend on target defaults changing upstream.
+rustflags = ["-C", "target-feature=+crt-static"]

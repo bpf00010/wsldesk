@@ -1,0 +1,46 @@
+[package]
+name = "win-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WSLDesk Windows host binary (wsldesk.exe)"
+
+[[bin]]
+name = "wsldesk"
+path = "src/main.rs"
+
+[features]
+embed-guest = []
+
+[dependencies]
+common = { path = "../common" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Win32 AF_HYPERV transport (Milestone 2) + console handler for clean
+# teardown on Ctrl+C / window close (Milestone 4A). Links against ws2_32.dll.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Hypervisor",
+    "Win32_System_Memory",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+uuid = { workspace = true }
+lz4_flex = { workspace = true }
+# Native D3D12 viewport (Milestone 4A, Plan.Md §5): winit window + wgpu
+# surface (Backends::DX12), fullscreen-triangle WGSL path.
+winit = "0.30"
+wgpu = "25"
+pollster = "1"

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec google-chrome-stable --ozone-platform=wayland --enable-features=UseOzonePlatform --disable-gpu-sandbox --no-first-run "$@"

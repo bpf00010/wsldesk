@@ -1,0 +1,36 @@
+[package]
+name = "wsl-guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WSLDesk static Linux guest binary (wsldesk-guest, x86_64-unknown-linux-musl)"
+
+[[bin]]
+name = "wsldesk-guest"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure-Rust only (musl static discipline): no C-linked crates here. vsock and
+# tokio-vsock are libc-syscall bindings (statically linked musl libc) — no
+# dlopen/glibc dependencies.
+common = { path = "../common" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
+vsock = "0.5"
+tokio-vsock = "0.7"
+# Namespace/mount/signal syscalls for session isolation (pure Rust bindings;
+# Plan.Md §2C feature set: sched, mount, user, process, signal).
+nix = { version = "0.31", features = ["sched", "mount", "user", "process", "signal", "fs", "mman", "poll"] }
+# Pure-Rust Wayland wire protocol ONLY (Plan.Md guardrail): the `system`
+# feature (libwayland-client.so) is FORBIDDEN — never enable it.
+wayland-client = { version = "0.31", default-features = true }
+wayland-protocols-wlr = { version = "0.3", default-features = true, features = ["client"] }
+# zwp_virtual_keyboard_manager_v1 (client-side only; pure Rust).
+wayland-protocols-misc = { version = "0.3", default-features = true, features = ["client"] }
+lz4_flex = { workspace = true }
+# Clipboard dedup hashing (pure Rust).
+sha2 = { workspace = true }
+hex = { workspace = true }
